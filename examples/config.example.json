@@ -1,0 +1,58 @@
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "type": "https", "tag": "dns-proxy", "server": "1.1.1.1", "detour": "proxy" },
+      { "type": "udp", "tag": "dns-direct", "server": "1.1.1.1" }
+    ],
+    "final": "dns-proxy",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun", "tag": "tun-in", "address": ["172.18.0.1/30"], "mtu": 9000,
+      "auto_route": true, "strict_route": true, "stack": "gvisor"
+    }
+  ],
+  "outbounds": [
+    { "type": "selector", "tag": "proxy", "outbounds": ["Авто", "node-1", "node-2"], "default": "Авто" },
+    {
+      "type": "urltest", "tag": "Авто", "outbounds": ["node-1", "node-2"],
+      "url": "https://www.gstatic.com/generate_204", "interval": "30s", "tolerance": 50
+    },
+    {
+      "type": "vless", "tag": "node-1", "server": "node1.example.com", "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000", "flow": "xtls-rprx-vision", "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true, "server_name": "www.example.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "short_id": "0123456789abcdef" }
+      }
+    },
+    {
+      "type": "vless", "tag": "node-2", "server": "node2.example.com", "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000", "flow": "xtls-rprx-vision", "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true, "server_name": "www.example.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "short_id": "0123456789abcdef" }
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "find_process": true,
+    "default_domain_resolver": { "server": "dns-direct" }
+  },
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9190" },
+    "cache_file": { "enabled": true, "path": "/Users/USERNAME/.local/share/sing-box/cache.db" }
+  }
+}

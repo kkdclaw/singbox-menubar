@@ -1,0 +1,8 @@
+# Беспарольный launchctl только для демона sing-box — нужен кнопке «Включить/Выключить».
+# Заменить USERNAME на своё имя пользователя (whoami) и поставить:
+#   sudo install -o root -g wheel -m 440 sudoers-singbox /etc/sudoers.d/singbox && sudo visudo -c
+# Правило разрешает ровно четыре команды для одного демона и ничего больше.
+USERNAME ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/com.kkd.singbox
+USERNAME ALL=(root) NOPASSWD: /bin/launchctl bootout system/com.kkd.singbox
+USERNAME ALL=(root) NOPASSWD: /bin/launchctl bootstrap system /Library/LaunchDaemons/com.kkd.singbox.plist
+USERNAME ALL=(root) NOPASSWD: /bin/launchctl print system/com.kkd.singbox
