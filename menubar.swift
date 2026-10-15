@@ -9,14 +9,21 @@ let API     = "http://127.0.0.1:9190"
 let TESTURL = "https://www.gstatic.com/generate_204"
 let KEY_SPEED = "showSpeed"
 
+/// Команда через /bin/sh. Вывод читаем ДО waitUntilExit: иначе при ответе больше 64 КБ
+/// (например /connections с сотней соединений) пайп переполняется, процесс виснет на записи,
+/// мы — на ожидании, и опрос никогда не завершается.
 @discardableResult
 func sh(_ cmd: String) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/sh")
     p.arguments = ["-c", cmd]
-    let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-    try? p.run(); p.waitUntilExit()
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    do { try p.run() } catch { return "" }
     let d = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
     return (String(data: d, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
@@ -68,10 +75,18 @@ struct State {
     var direct:  [Conn] { conns.filter { $0.exit == "direct" } }
 }
 
-final class App: NSObject, NSApplicationDelegate {
+/// Что происходит после клика «Включить/Выключить», пока launchctl не отработал
+enum Pending { case none, turningOn, turningOff }
+
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    let menu = NSMenu()      // одно меню на всё время жизни: подмена item.menu под открытым меню оставляет кнопку «нажатой»
     var timer: Timer?
     var st = State()
+    var pending = Pending.none
+    var gen = 0, applied = 0, barrier = 0   // номера опросов: устаревшие ответы (старше применённого или начатые до переключения) выбрасываем
+    // строки открытого меню, которые обновляем на месте при каждом опросе
+    var liveToggle, liveStatus, liveNow, liveSession, liveConns, liveSpeed: NSMenuItem?
     var lastUp = 0, lastDown = 0
     var lastStamp = Date()
     var lastConn: [String: (up: Int, down: Int)] = [:]
@@ -82,14 +97,22 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        menu.delegate = self
+        menu.autoenablesItems = false
+        item.menu = menu
         render()
         tick()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in self.tick() }
+        // .common — таймер тикает и пока меню открыто (в .default он замирает вместе с меню)
+        let t = Timer(timeInterval: 2, repeats: true) { _ in self.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     // MARK: сбор данных (в фоне, чтобы не морозить меню)
 
     func tick() {
+        gen += 1
+        let g = gen
         DispatchQueue.global(qos: .utility).async {
             var s = State()
             s.on = isRunning()
@@ -150,7 +173,11 @@ final class App: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            DispatchQueue.main.async { self.apply(s) }
+            DispatchQueue.main.async {
+                guard g > self.applied, g > self.barrier else { return }
+                self.applied = g
+                self.apply(s)
+            }
         }
     }
 
@@ -178,9 +205,15 @@ final class App: NSObject, NSApplicationDelegate {
 
     // MARK: строка меню
 
-    func icon(on: Bool) -> NSImage? {
-        let name = on ? "checkmark.shield.fill" : "xmark.shield.fill"
-        let color: NSColor = on ? .systemGreen : .systemGray
+    func icon() -> NSImage? {
+        let name: String, color: NSColor
+        switch pending {
+        case .none:
+            name = st.on ? "checkmark.shield.fill" : "xmark.shield.fill"
+            color = st.on ? .systemGreen : .systemGray
+        default:
+            name = "shield.lefthalf.filled"; color = .systemOrange   // переключаемся
+        }
         let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
             .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
         guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
@@ -189,7 +222,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func render() {
-        item.button?.image = icon(on: st.on)
+        item.button?.image = icon()
         item.button?.imagePosition = (showSpeed && st.on) ? .imageLeading : .imageOnly
 
         if showSpeed && st.on {
@@ -208,7 +241,13 @@ final class App: NSObject, NSApplicationDelegate {
             item.button?.title = ""
         }
         item.button?.toolTip = st.on ? "sing-box: \(st.now)" : "sing-box выключен"
-        buildMenu()
+        // меню не перестраиваем (оно собирается при открытии), только освежаем живые строки
+        if let t = liveToggle { fillToggle(t) }
+        liveStatus?.title = statusLine()
+        liveNow?.title = nowLine()
+        liveSession?.title = sessionLine()
+        liveConns?.title = connsLine()
+        liveSpeed?.state = showSpeed ? .on : .off
     }
 
     // MARK: меню
@@ -227,70 +266,96 @@ final class App: NSObject, NSApplicationDelegate {
         return mi
     }
 
-    func buildMenu() {
-        let m = NSMenu()
+    // Меню собирается заново при каждом открытии (NSMenuDelegate), а не при каждом опросе:
+    // замена item.menu под открытым меню — та самая «залипшая» кнопка.
+    func menuNeedsUpdate(_ m: NSMenu) { rebuild() }
+    func menuWillOpen(_ m: NSMenu) { tick() }
+
+    func statusLine() -> String {
+        if let ms = st.delays[st.now] { return "Работает · \(st.now) · \(ms) мс" }
+        return "Работает · \(st.now)"
+    }
+    func nowLine() -> String { "Сейчас:     ↑ \(rate(st.upRate))   ↓ \(rate(st.downRate))" }
+    func sessionLine() -> String { "За сессию:  ↑ \(bytes(st.upTotal))   ↓ \(bytes(st.downTotal))" }
+    func connsLine() -> String {
+        let d = st.direct.count
+        return "Соединений: \(st.conns.count) · в туннелях \(st.conns.count - d) · напрямую \(d)"
+    }
+
+    /// Верхний пункт: «Выключить»/«Включить», а пока launchctl работает — «Выключаю…» без действия
+    func fillToggle(_ mi: NSMenuItem) {
+        switch pending {
+        case .turningOn:  mi.title = "Включаю…";  mi.action = nil; mi.isEnabled = false
+        case .turningOff: mi.title = "Выключаю…"; mi.action = nil; mi.isEnabled = false
+        case .none:
+            mi.title = st.on ? "Выключить" : "Включить"
+            mi.action = #selector(toggle); mi.target = self; mi.isEnabled = true
+        }
+    }
+
+    func rebuild() {
+        menu.removeAllItems()
+        liveStatus = nil; liveNow = nil; liveSession = nil; liveConns = nil; liveSpeed = nil
+
+        // включить/выключить — всегда первым пунктом, отдельно от остального
+        let t = NSMenuItem(); fillToggle(t)
+        liveToggle = t
+        menu.addItem(t)
+        menu.addItem(.separator())
 
         guard st.on else {
-            m.addItem(info("Выключен — весь трафик напрямую"))
-            m.addItem(.separator())
-            m.addItem(act("Включить", #selector(toggle)))
-            m.addItem(act("Открыть конфиг", #selector(openConf)))
-            m.addItem(act("Показать лог", #selector(openLog)))
-            m.addItem(.separator())
-            m.addItem(act("Выйти из индикатора", #selector(quit)))
-            item.menu = m
+            menu.addItem(info("Выключен — весь трафик напрямую"))
+            menu.addItem(.separator())
+            menu.addItem(act("Открыть конфиг", #selector(openConf)))
+            menu.addItem(act("Показать лог", #selector(openLog)))
+            menu.addItem(.separator())
+            menu.addItem(act("Выйти из индикатора", #selector(quit)))
             return
         }
 
         // состояние
-        if let ms = st.delays[st.now] {
-            m.addItem(info("Работает · \(st.now) · \(ms) мс"))
-        } else {
-            m.addItem(info("Работает · \(st.now)"))
-        }
-        m.addItem(info("Сейчас:     ↑ \(rate(st.upRate))   ↓ \(rate(st.downRate))"))
-        m.addItem(info("За сессию:  ↑ \(bytes(st.upTotal))   ↓ \(bytes(st.downTotal))"))
-
-        let d = st.direct
-        m.addItem(info("Соединений: \(st.conns.count) · в туннелях \(st.conns.count - d.count) · напрямую \(d.count)"))
-        m.addItem(.separator())
+        liveStatus = info(statusLine());   menu.addItem(liveStatus!)
+        liveNow = info(nowLine());         menu.addItem(liveNow!)
+        liveSession = info(sessionLine()); menu.addItem(liveSession!)
+        liveConns = info(connsLine());     menu.addItem(liveConns!)
+        menu.addItem(.separator())
 
         // что в какой туннель уходит / что мимо
+        let d = st.direct
         var names = st.exits
         for c in st.conns where c.exit != "direct" && !names.contains(c.exit) { names.append(c.exit) }
         for name in names {
             let cs = st.conns.filter { $0.exit == name }
-            m.addItem(sub(exitTitle(name, cs.count), cs, empty: "Сейчас через \(name) ничего не идёт"))
+            menu.addItem(sub(exitTitle(name, cs.count), cs, empty: "Сейчас через \(name) ничего не идёт"))
         }
-        m.addItem(sub(exitTitle("Напрямую", d.count, key: "direct"), d, empty: "Нет прямых соединений"))
-        m.addItem(.separator())
+        menu.addItem(sub(exitTitle("Напрямую", d.count, key: "direct"), d, empty: "Нет прямых соединений"))
+        menu.addItem(.separator())
 
         // какая группа правил куда сейчас ведёт
         if !st.routes.isEmpty {
-            m.addItem(info("Правила → выход"))
-            for r in st.routes { m.addItem(info("   \(r.group) → \(r.exit)")) }
-            m.addItem(.separator())
+            menu.addItem(info("Правила → выход"))
+            for r in st.routes { menu.addItem(info("   \(r.group) → \(r.exit)")) }
+            menu.addItem(.separator())
         }
 
         // сервер
-        m.addItem(info("Сервер"))
+        menu.addItem(info("Сервер"))
         for name in st.all {
             let label: String
             if name == "Авто" { label = "   Авто — самый быстрый" }
             else if let ms = st.delays[name] { label = "   \(name) — \(ms) мс" }
             else { label = "   \(name) — нет замера" }
-            m.addItem(act(label, #selector(pick(_:)), on: name == st.now, obj: name))
+            menu.addItem(act(label, #selector(pick(_:)), on: name == st.now, obj: name))
         }
-        m.addItem(act("Перепроверить задержки", #selector(recheck)))
-        m.addItem(.separator())
+        menu.addItem(act("Перепроверить задержки", #selector(recheck)))
+        menu.addItem(.separator())
 
-        m.addItem(act("Показывать скорость в меню-баре", #selector(toggleSpeed), on: showSpeed))
-        m.addItem(act("Выключить", #selector(toggle)))
-        m.addItem(act("Открыть конфиг", #selector(openConf)))
-        m.addItem(act("Показать лог", #selector(openLog)))
-        m.addItem(.separator())
-        m.addItem(act("Выйти из индикатора", #selector(quit)))
-        item.menu = m
+        liveSpeed = act("Показывать скорость в меню-баре", #selector(toggleSpeed), on: showSpeed)
+        menu.addItem(liveSpeed!)
+        menu.addItem(act("Открыть конфиг", #selector(openConf)))
+        menu.addItem(act("Показать лог", #selector(openLog)))
+        menu.addItem(.separator())
+        menu.addItem(act("Выйти из индикатора", #selector(quit)))
     }
 
     /// «node-1 · 240 мс — 12   ↓ 300 КБ/с ↑ 10 КБ/с»
@@ -372,16 +437,25 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggle() {
-        let wasOn = st.on
+        guard pending == .none else { return }      // второй клик, пока первый не отработал
+        let turnOn = !st.on
+        pending = turnOn ? .turningOn : .turningOff
+        render()                                    // иконка и верхний пункт — сразу, не ждём опроса
         DispatchQueue.global().async {
-            sh(wasOn ? "/usr/bin/sudo -n /bin/launchctl bootout system/\(LABEL)"
-                     : "/usr/bin/sudo -n /bin/launchctl bootstrap system \(PLIST)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.tick() }
+            // bootout возвращается, когда демон уже вышел (~1 с)
+            sh(turnOn ? "/usr/bin/sudo -n /bin/launchctl bootstrap system \(PLIST)"
+                      : "/usr/bin/sudo -n /bin/launchctl bootout system/\(LABEL)")
+            DispatchQueue.main.async {
+                self.pending = .none
+                self.barrier = self.gen             // опросы, начатые во время переключения, уже неверны
+                self.tick()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.tick() }   // Clash API поднимается чуть позже демона
+            }
         }
     }
 
-    @objc func openConf() { sh("/usr/bin/open -t '\(CONF)'") }
-    @objc func openLog()  { sh("/usr/bin/open -a Console '\(LOG)' 2>/dev/null || /usr/bin/open -t '\(LOG)'") }
+    @objc func openConf() { DispatchQueue.global().async { sh("/usr/bin/open -t '\(CONF)'") } }
+    @objc func openLog()  { DispatchQueue.global().async { sh("/usr/bin/open -a Console '\(LOG)' 2>/dev/null || /usr/bin/open -t '\(LOG)'") } }
     @objc func quit()     { NSApp.terminate(nil) }
 }
 
